@@ -6,14 +6,18 @@
 #include <memory>
 #include <algorithm>
 #include <bitset>
+#include <sstream>
+#include <string>
+#include <boost/dynamic_bitset.hpp>
 
 #include "pin.H"
 
 std::ofstream ofs;
+std::ofstream ofsdom;
 
+typedef unsigned int id_t;
 typedef std::set<ADDRINT> leaders_t;
 typedef std::map<ADDRINT, ADDRINT> jumps_t;
-typedef std::map<ADDRINT, std::set<ADDRINT> > dominators_t;
 
 typedef struct bbl_stub_t {
     leaders_t* leaders;
@@ -23,22 +27,49 @@ typedef struct bbl_stub_t {
         : leaders(leaders), jumps(jumps) {}
 } bbl_stub_t;
 
-typedef struct bbl_t {
+class bbl_t {
+public:
+    typedef std::vector<bbl_t*> bblVec_t;
+
+    id_t id;
     ADDRINT entry_ins;
     ADDRINT exit_ins;
-    std::set<struct bbl_t*> predecessors;
-    struct bbl_t* successor;
-    struct bbl_t* target;
+    std::set<id_t> predecessors;
+    std::set<id_t> dominators;
+    bbl_t* successor;
+    bbl_t* target;
 
     bbl_t( ADDRINT entry_ins,
-           struct bbl_t* predecessor )
-        : entry_ins(entry_ins), successor(nullptr), target(nullptr) {
-        predecessors.insert( predecessor );
+           bbl_t* predecessor )
+        : id(gID++), entry_ins(entry_ins), successor(nullptr), target(nullptr) {
+        if (predecessor)
+            predecessors.insert( predecessor->id );
+        gBasicBlocks.push_back(this);
     }
-} bbl_t;
 
-unsigned int firstPhase( RTN rtn,
-                         bbl_stub_t& bs ) {
+    static void reset() {
+        bbl_t::gID = 0;
+        bbl_t::gBasicBlocks.clear();
+    }
+
+    static bbl_t* get(id_t id) {
+        return gBasicBlocks[id];
+    }
+
+    static size_t size() {
+        return gBasicBlocks.size();
+    }
+
+private:
+    static id_t gID;
+    static bblVec_t gBasicBlocks;
+};
+
+id_t bbl_t::gID = 0;
+bbl_t::bblVec_t bbl_t::gBasicBlocks;
+
+void firstPhase( RTN rtn,
+                 bbl_stub_t& bs ) {
 
     bool isFirst = true;
 
@@ -65,16 +96,12 @@ unsigned int firstPhase( RTN rtn,
     // to preserve space, release data associated with RTN after we
     // have processed it
     RTN_Close(rtn);
-
-    return bs.leaders->size();
 }
 
 bbl_t* secondPhase( RTN rtn,
-                    const bbl_stub_t& bs,
-                    unsigned int nBBL ) {
+                    const bbl_stub_t& bs ) {
 
     std::map<ADDRINT, bbl_t*> leaderBBLMap, exitBBLMap;
-    std::bitset<nBBL>   <
     bbl_t *root = nullptr, *curBBL = nullptr;
 
     RTN_Open(rtn);
@@ -93,11 +120,11 @@ bbl_t* secondPhase( RTN rtn,
     while (INS_Valid(in)) {
         ADDRINT insAddr = INS_Address(in);
         if (bs.leaders->find( insAddr ) != bs.leaders->end()) {
-            bbl_t** successor = &curBBL->successor;
-            bbl_t* predecessor = curBBL;
+            bbl_t **successor = &curBBL->successor;
+            bbl_t *predecessor = curBBL;
             exitBBLMap[curBBL->exit_ins] = curBBL;        
             curBBL = new bbl_t( insAddr, curBBL );
-            curBBL->predecessors.insert(predecessor);
+            curBBL->predecessors.insert(predecessor->id);
             leaderBBLMap[insAddr] = curBBL;
             *successor = curBBL;
         }
@@ -115,7 +142,7 @@ bbl_t* secondPhase( RTN rtn,
         if (source != exitBBLMap.end()) {
             if (target != leaderBBLMap.end()) {
 
-                source->second->predecessors.insert(target->second);
+                source->second->predecessors.insert(target->second->id);
                 target->second->target = source->second;
             }
         }
@@ -125,52 +152,90 @@ bbl_t* secondPhase( RTN rtn,
 }
 
 void getDominators(bbl_t* root,
-                   const bbl_stub_t& bs,
-                   dominators_t& dom) {
+                   const size_t nBBL) {
 
-    bbl_t* node = nullptr;
+    bool changed = true;
+    std::unique_ptr< boost::dynamic_bitset<> >* domBitSets =
+            new std::unique_ptr< boost::dynamic_bitset<> >[nBBL];
+    for (size_t i=0; i<nBBL; ++i)
+        domBitSets[i] = std::unique_ptr< boost::dynamic_bitset<> >(new boost::dynamic_bitset<>(nBBL));
 
-    for (node = root; node != nullptr; node = node->successor) {
+    // initialize dominator bitsets
+    domBitSets[0]->reset();
+    domBitSets[0]->set(0);
+    for (size_t i=1; i<nBBL; ++i)
+        domBitSets[i]->set();
 
-        std::set<ADDRINT> &dominators = dom[node->entry_ins];
-        std::set<ADDRINT> intersection = leaders;
-
-        for (auto pred : node->predecessors) {
-            if (pred) {
-
-                if ( dominators.find(pred->entry_ins) != dominators.end() ) {
-                    std::set<ADDRINT> result;
-
-
-                    std::set_intersection(intersection.begin(), intersection.end(),
-                                          dominators[pred->entry_ins].begin(), dominators)
-
-                }
-
-                std::set_intersection()
-
-
-            }
+    // compute dominators (fixpoint algorithm)
+    while (changed) {
+        changed = false;
+        for (size_t i=1; i<nBBL; ++i) {
+            boost::dynamic_bitset<> tmp(*domBitSets[i].get());
+            for (id_t pred : bbl_t::get(i)->predecessors)
+                *domBitSets[i].get() &= *domBitSets[pred].get();
+            if (tmp != *domBitSets[i].get())
+                changed = true;
         }
-
     }
 
+    // fill dominators in bbl's
+    for (size_t i=0; i<nBBL; ++i)
+        for (size_t j=0; j<nBBL; ++j)
+            if (domBitSets[i]->test(j))
+                bbl_t::get(i)->dominators.insert(j);
 }
 
-void printBBL(bbl_t* node, int level) {
+std::string getNodeStr(bbl_t* node) {
+    std::stringstream ss;
+    ss << "\t\"" << node->id << ": " << node->entry_ins << "\"";
+    return ss.str();
+}
 
-    ofs << level << " node: " << node->entry_ins << std::endl;
-    ofs << level << "    pred: ";
-    for (auto pred : node->predecessors) {
-        if (pred)
-            ofs << pred->entry_ins << ", ";
+void printCFG(bbl_t* node, int level) {
+
+    if (level == 0) {
+        ofs << "digraph CFG {" << std::endl;
+        ofs << "\tgraph [fontname=\"fixed\"];" << std::endl;
+        ofs << "\tnode [fontname=\"fixed\"];" << std::endl;
+        ofs << "\tedge [fontname=\"fixed\"];" << std::endl;
     }
-    ofs << std::endl;
-    if (node->successor != nullptr) {
-        ofs << level << "     succ: " << std::endl;
-        printBBL(node->successor, level+1);
+    ofs << getNodeStr(node) << ";" << std::endl;
+
+    if (node->successor) {
+        printCFG(node->successor, level+1);
+        ofs << getNodeStr(node) << "->" << getNodeStr(node->successor)
+            << ";" << std::endl;
     }
-    delete node;
+
+    if (node->target) {
+        ofs << getNodeStr(node) << "->" << getNodeStr(node->target)
+            << " [style=dotted];" << std::endl;
+    }
+
+    if (level == 0)
+        ofs << "}";
+}
+
+void printDOM(bbl_t* node, int level) {
+
+    if (level == 0) {
+        ofsdom << "digraph DOM {" << std::endl;
+        ofsdom << "\tgraph [fontname=\"fixed\"];" << std::endl;
+        ofsdom << "\tnode [fontname=\"fixed\"];" << std::endl;
+        ofsdom << "\tedge [fontname=\"fixed\"];" << std::endl;
+    }
+    ofsdom << getNodeStr(node) << ";" << std::endl;
+
+    for (auto dom : node->dominators) {
+        ofsdom << "\t" << getNodeStr(bbl_t::get(dom)) << "->"
+                    << getNodeStr(node) << ";" << std::endl;
+    }
+
+    if (node->successor)
+        printDOM(node->successor, level+1);
+
+    if (level == 0)
+        ofsdom << "}";
 }
 
 VOID ImgLoad(IMG img, VOID *v) {
@@ -184,17 +249,17 @@ VOID ImgLoad(IMG img, VOID *v) {
             const string& name = RTN_Name(rtn);
             std::unique_ptr<leaders_t> leaders {new leaders_t};
             std::unique_ptr<jumps_t> jumps {new jumps_t};
-            dominators_t dominators;
+            bbl_t::reset();
 
             bbl_stub_t bbl_stub( leaders.get(), jumps.get() );
+            firstPhase( rtn, bbl_stub );
+            bbl_t* root = secondPhase( rtn, bbl_stub );
+            getDominators(root, bbl_t::size());
 
-            unsigned int nBBL = firstPhase( rtn, bbl_stub );
-            bbl_t* root = secondPhase( rtn, bbl_stub, nBBL );
-
-            ofs << "Routine: " << name << std::endl;
-            getDominators(root, dominators);
-
-            //printBBL(root, 0);
+            if (name == "main") {
+                printCFG(root, 0);
+                printDOM(root, 0);
+            }
         }
     }
 }
@@ -202,15 +267,16 @@ VOID ImgLoad(IMG img, VOID *v) {
 VOID Fini(INT32 code, VOID *v) {
 
     ofs.close();
+    ofsdom.close();
 }
-
 
 /* ===================================================================== */
 /* Main                                                                  */
 /* ===================================================================== */
 int main(int argc, char * argv[]) {
 
-    ofs.open ("test.out", std::ofstream::out);
+    ofs.open ("main.dot", std::ofstream::out);
+    ofsdom.open ("dommain.dot", std::ofstream::out);
 
     // prepare for image instrumentation mode
     PIN_InitSymbolsAlt(IFUNC_SYMBOLS);
