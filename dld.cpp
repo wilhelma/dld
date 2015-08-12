@@ -24,35 +24,44 @@ public:
     typedef std::vector<BasicBlock*> bbls_t;
 
     // attributes
-    id_t id;
-    ADDRINT entry_ins;
-    ADDRINT exit_ins;
-    std::set<id_t> predecessors;
-    std::set<id_t> dominators;
-    BasicBlock* successor;
-    BasicBlock* target;
+    id_t id;						// id of the basic block (starting from 0)
+    ADDRINT entry_ins;				// address of the first instruction
+    ADDRINT exit_ins;				// address of the last instruction
+    std::set<id_t> predecessors;	// set of id's of all predecessors
+    std::set<id_t> dominators;		// set of id's of all dominators
+    BasicBlock* successor;			// pointer to the successor
+    BasicBlock* target;			// pointer to the target (if existing)
+    BasicBlock* iDom;				// immediate dominator
 
     //--------------------------------------------------------------------------
-    BasicBlock( ADDRINT entry_ins,
-                BasicBlock* predecessor )
+
+    // the constructor
+    explicit BasicBlock( ADDRINT entry_ins,
+                         BasicBlock* predecessor )
             : id(gID++), entry_ins(entry_ins),
-              successor(nullptr), target(nullptr) {
+              successor(nullptr), target(nullptr), iDom(nullptr) {
 
         if (predecessor)
             predecessors.insert( predecessor->id );
         gBasicBlocks.push_back(this);
     }
 
+    // resets the static information
     static void reset() {
-        BasicBlock::gID = 0;
-        BasicBlock::gBasicBlocks.clear();
+
+        gID = 0;
+        gBasicBlocks.clear();
     }
 
+    // get pointer to the basic block with given id
     static BasicBlock* get(id_t id) {
+
         return gBasicBlocks[id];
     }
 
+    // get current number of inserted basic blocks
     static size_t size() {
+
         return gBasicBlocks.size();
     }
 
@@ -67,18 +76,21 @@ BasicBlock::bbls_t BasicBlock::gBasicBlocks;
  * global functions
  ******************************************************************************/
 
-/*
- * firstphase
+/* getBBLFrontiers()
+ *
+ * iterates over all instruction in a given routine rtn to:
+ * 	- identify the entry instruction of every static (compiler) BBL (=leaders)
+ *  - identify all unconditional jumps (=jumps)
  */
-void firstPhase( RTN rtn,
-                 leaders_t& leaders,
-                 jumps_t& jumps ) {
+void getBBLFrotniers( RTN rtn,
+                    leaders_t& leaders,
+                    jumps_t& jumps ) {
 
     bool isFirst = true;
 
     RTN_Open(rtn);
-    for (INS in = RTN_InsHead(rtn); INS_Valid(in); in = INS_Next(in))
-    {
+    for (INS in = RTN_InsHead(rtn); INS_Valid(in); in = INS_Next(in)) {
+
         if (isFirst) {
             leaders.insert( INS_Address(in) );
             isFirst = false;
@@ -90,14 +102,23 @@ void firstPhase( RTN rtn,
             jumps[INS_Address(in)] = target;
             isFirst = true;
         }
-
     }
     RTN_Close(rtn);
 }
 
-BasicBlock* secondPhase( RTN rtn,
-                    const leaders_t& leaders,
-                    const jumps_t& jumps ) {
+/* getStaticBBLs()
+ *
+ * builds a cfg consisting of newly allocated bbl's and returning the root of
+ * the cfg.
+ * This is done by considering each leader instruction as the beginning of a
+ * bbl, each transition as a successor relation, and each jump as a target
+ * relation. The predecessor attribute is filled accordingly to the successor
+ * and target relation. The dominator attribute is not filled here (see
+ * getDominators()).
+ */
+BasicBlock* getStaticBBLs( RTN rtn,
+                           const leaders_t& leaders,
+                           const jumps_t& jumps ) {
 
     std::map<ADDRINT, BasicBlock*> leaderBBLMap, exitBBLMap;
     BasicBlock *root = nullptr, *curBBL = nullptr;
@@ -109,8 +130,8 @@ BasicBlock* secondPhase( RTN rtn,
     if (INS_Valid(in)) {
         ADDRINT insAddr = INS_Address(in);
         root = curBBL = new BasicBlock( insAddr, nullptr );
-        leaderBBLMap[insAddr] = root;
-        root->exit_ins = insAddr;
+        leaderBBLMap[insAddr] = curBBL;
+        curBBL->exit_ins = insAddr;
         in = INS_Next(in);
     }
     
@@ -119,27 +140,23 @@ BasicBlock* secondPhase( RTN rtn,
         ADDRINT insAddr = INS_Address(in);
         if (leaders.find( insAddr ) != leaders.end()) {
             BasicBlock **successor = &curBBL->successor;
-            BasicBlock *predecessor = curBBL;
             exitBBLMap[curBBL->exit_ins] = curBBL;        
             curBBL = new BasicBlock( insAddr, curBBL );
-            curBBL->predecessors.insert(predecessor->id);
             leaderBBLMap[insAddr] = curBBL;
             *successor = curBBL;
         }
         curBBL->exit_ins = insAddr;
         in = INS_Next(in);
     }
-
     RTN_Close(rtn);
 
+    // consider jump instructions (for targets/predecessors)
     for ( auto edge : jumps ) {
-
         auto source = exitBBLMap.find( edge.first );
         auto target = leaderBBLMap.find( edge.second );
 
         if (source != exitBBLMap.end()) {
             if (target != leaderBBLMap.end()) {
-
                 source->second->predecessors.insert(target->second->id);
                 target->second->target = source->second;
             }
@@ -149,28 +166,35 @@ BasicBlock* secondPhase( RTN rtn,
     return root;
 }
 
-void getDominators(BasicBlock* root,
-                   const size_t nBBL) {
+/* getDominators()
+ *
+ * computes the dominators of all basic blocks in the cfg
+ */
+void getDominators( BasicBlock* root ) {
 
-    bool changed = true;
+    const size_t nBBL = BasicBlock::size();
     std::unique_ptr< boost::dynamic_bitset<> >* domBitSets =
             new std::unique_ptr< boost::dynamic_bitset<> >[nBBL];
-    for (size_t i=0; i<nBBL; ++i)
-        domBitSets[i] = std::unique_ptr< boost::dynamic_bitset<> >(new boost::dynamic_bitset<>(nBBL));
 
-    // initialize dominator bitsets
+    // for each bbl, create a dominator bitset for efficient set operations
+    for (size_t i=0; i<nBBL; ++i)
+        domBitSets[i] = std::unique_ptr< boost::dynamic_bitset<> >(
+                    new boost::dynamic_bitset<>(nBBL) );
+
     domBitSets[0]->reset();
     domBitSets[0]->set(0);
     for (size_t i=1; i<nBBL; ++i)
         domBitSets[i]->set();
 
     // compute dominators (fixpoint algorithm)
+    bool changed = true;
     while (changed) {
         changed = false;
         for (size_t i=1; i<nBBL; ++i) {
             boost::dynamic_bitset<> tmp(*domBitSets[i].get());
             for (BasicBlock::id_t pred : BasicBlock::get(i)->predecessors)
                 *domBitSets[i].get() &= *domBitSets[pred].get();
+            domBitSets[i]->set(i);
             if (tmp != *domBitSets[i].get())
                 changed = true;
         }
@@ -181,6 +205,16 @@ void getDominators(BasicBlock* root,
         for (size_t j=0; j<nBBL; ++j)
             if (domBitSets[i]->test(j))
                 BasicBlock::get(i)->dominators.insert(j);
+
+    // compute immediate dominators
+    for (size_t i=1; i<nBBL; ++i) {
+        domBitSets[i]->flip(i);
+        for (size_t j=1; j<nBBL; ++j) {
+            *domBitSets[i].get() &= domBitSets[j]->flip();
+        }
+        BasicBlock::get(i)->iDom = BasicBlock::get(
+                    domBitSets[i]->find_first() );
+    }
 }
 
 std::string getNodeStr(BasicBlock* node) {
@@ -229,6 +263,7 @@ void printDOM( BasicBlock* node,
     ofs << getNodeStr(node) << ";" << std::endl;
 
     for (auto dom : node->dominators) {
+
         ofs << "\t" << getNodeStr(BasicBlock::get(dom)) << "->"
                     << getNodeStr(node) << ";" << std::endl;
     }
@@ -253,9 +288,9 @@ VOID ImgLoad(IMG img, VOID *v) {
             std::unique_ptr<jumps_t> jumps {new jumps_t};
             BasicBlock::reset();
 
-            firstPhase( rtn, *leaders.get(), *jumps.get() );
-            BasicBlock* root = secondPhase( rtn, *leaders.get(), *jumps.get() );
-            getDominators(root, BasicBlock::size());
+            getBBLFrotniers( rtn, *leaders.get(), *jumps.get() );
+            BasicBlock* root = getStaticBBLs( rtn, *leaders.get(), *jumps.get() );
+            getDominators(root);
 
             if (name == "main") {
               std::ofstream ofs;
