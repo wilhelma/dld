@@ -12,6 +12,9 @@
 // types
 typedef std::set<ADDRINT> leaders_t;
 typedef std::map<ADDRINT, ADDRINT> jumps_t;
+typedef std::map<ADDRINT, std::string> dissmap_t;
+
+dissmap_t dissmap;
 
 /*
  * class BasicBlock
@@ -20,7 +23,7 @@ class BasicBlock {
 public:
 
     // types
-    typedef unsigned int id_t;
+    typedef size_t id_t;
     typedef std::vector<BasicBlock*> bbls_t;
 
     // attributes
@@ -82,7 +85,7 @@ BasicBlock::bbls_t BasicBlock::gBasicBlocks;
  * 	- identify the entry instruction of every static (compiler) BBL (=leaders)
  *  - identify all unconditional jumps (=jumps)
  */
-void getBBLFrotniers( RTN rtn,
+void getBBLFrontiers( RTN rtn,
                     leaders_t& leaders,
                     jumps_t& jumps ) {
 
@@ -91,10 +94,13 @@ void getBBLFrotniers( RTN rtn,
     RTN_Open(rtn);
     for (INS in = RTN_InsHead(rtn); INS_Valid(in); in = INS_Next(in)) {
 
+        dissmap[INS_Address(in)] = INS_Disassemble(in);
+
         if (isFirst) {
             leaders.insert( INS_Address(in) );
             isFirst = false;
         }
+
 
         if (INS_IsDirectBranchOrCall(in)) {
             ADDRINT target = INS_DirectBranchOrCallTargetAddress(in);
@@ -136,16 +142,21 @@ BasicBlock* getStaticBBLs( RTN rtn,
     }
     
     // other instructions
+    bool hasFallThrough = true;
     while (INS_Valid(in)) {
         ADDRINT insAddr = INS_Address(in);
         if (leaders.find( insAddr ) != leaders.end()) {
             BasicBlock **successor = &curBBL->successor;
-            exitBBLMap[curBBL->exit_ins] = curBBL;        
+            exitBBLMap[curBBL->exit_ins] = curBBL;
             curBBL = new BasicBlock( insAddr, curBBL );
             leaderBBLMap[insAddr] = curBBL;
-            *successor = curBBL;
+            //if (hasFallThrough)
+                *successor = curBBL;
         }
         curBBL->exit_ins = insAddr;
+        hasFallThrough = INS_HasFallThrough( in ) || INS_IsCall( in );
+        if (!hasFallThrough)
+          std::cout << "... " << INS_Disassemble( in ) << std::endl;
         in = INS_Next(in);
     }
     RTN_Close(rtn);
@@ -157,8 +168,10 @@ BasicBlock* getStaticBBLs( RTN rtn,
 
         if (source != exitBBLMap.end()) {
             if (target != leaderBBLMap.end()) {
-                source->second->predecessors.insert(target->second->id);
-                target->second->target = source->second;
+                target->second->predecessors.insert(source->second->id);
+                source->second->target = target->second;
+                if (!source->second->successor)
+                  source->second->successor = target->second;
             }
         }
     }
@@ -180,11 +193,10 @@ void getDominators( BasicBlock* root ) {
     for (size_t i=0; i<nBBL; ++i)
         domBitSets[i] = std::unique_ptr< boost::dynamic_bitset<> >(
                     new boost::dynamic_bitset<>(nBBL) );
-
     domBitSets[0]->reset();
     domBitSets[0]->set(0);
     for (size_t i=1; i<nBBL; ++i)
-        domBitSets[i]->set();
+      domBitSets[i]->set();
 
     // compute dominators (fixpoint algorithm)
     bool changed = true;
@@ -208,18 +220,32 @@ void getDominators( BasicBlock* root ) {
 
     // compute immediate dominators
     for (size_t i=1; i<nBBL; ++i) {
-        domBitSets[i]->flip(i);
-        for (size_t j=1; j<nBBL; ++j) {
-            *domBitSets[i].get() &= domBitSets[j]->flip();
+      for (BasicBlock::id_t m : BasicBlock::get(i)->dominators) {
+        bool isIDom = true;
+        if (m == i)
+          continue;
+
+        for (BasicBlock::id_t p : BasicBlock::get(i)->dominators) {
+          if (p == i || p == m)
+            continue;
+          if (!domBitSets[m]->test(p)) {
+            isIDom = false;
+            break;
+          }
         }
-        BasicBlock::get(i)->iDom = BasicBlock::get(
-                    domBitSets[i]->find_first() );
+
+        if (isIDom) {
+          BasicBlock::get(i)->iDom = BasicBlock::get(m);
+          break;
+        }
+      }
     }
+
 }
 
 std::string getNodeStr(BasicBlock* node) {
     std::stringstream ss;
-    ss << "\t\"" << node->id << ": " << node->entry_ins << "\"";
+    ss << "\t\"" << node->id << ": " << dissmap[node->entry_ins] << "\"";
     return ss.str();
 }
 
@@ -262,9 +288,8 @@ void printDOM( BasicBlock* node,
     }
     ofs << getNodeStr(node) << ";" << std::endl;
 
-    for (auto dom : node->dominators) {
-
-        ofs << "\t" << getNodeStr(BasicBlock::get(dom)) << "->"
+    if (node->iDom) {
+        ofs << "\t" << getNodeStr(node->iDom) << "->"
                     << getNodeStr(node) << ";" << std::endl;
     }
 
@@ -288,11 +313,15 @@ VOID ImgLoad(IMG img, VOID *v) {
             std::unique_ptr<jumps_t> jumps {new jumps_t};
             BasicBlock::reset();
 
-            getBBLFrotniers( rtn, *leaders.get(), *jumps.get() );
+            if (name == "main")
+              std::cout << "main" << std::endl;
+
+            getBBLFrontiers( rtn, *leaders.get(), *jumps.get() );
             BasicBlock* root = getStaticBBLs( rtn, *leaders.get(), *jumps.get() );
             getDominators(root);
 
             if (name == "main") {
+              std::cout << "end" << std::endl;
               std::ofstream ofs;
               std::ofstream ofsdom;
               ofs.open ("main.dot", std::ofstream::out);
