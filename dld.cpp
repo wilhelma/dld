@@ -1,6 +1,7 @@
 #include <iostream>
 #include <fstream>
 #include <set>
+#include <vector>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -68,12 +69,39 @@ public:
         return gBasicBlocks.size();
     }
 
+    bool isPredecessor(id_t searchID) {
+
+        for (id_t predID : predecessors) {
+            if (predID > id)
+                continue;
+            if (predID == searchID)
+                return true;
+            if (BasicBlock::get(predID)->isPredecessor(searchID))
+                return true;
+        }
+
+        return false;
+    }
+
 private:
     static BasicBlock::id_t gID;
     static bbls_t gBasicBlocks;
 };
 BasicBlock::id_t BasicBlock::gID = 0;
 BasicBlock::bbls_t BasicBlock::gBasicBlocks;
+
+struct Loop {
+    typedef std::map<ADDRINT, Loop*> insLoopMap_t;
+
+    BasicBlock::id_t head;
+    BasicBlock::id_t tail;
+    std::set<BasicBlock::id_t> nodes;
+    std::set<BasicBlock::id_t> exits;
+
+    static insLoopMap_t insLoopMap;
+};
+Loop::insLoopMap_t Loop::insLoopMap;
+
 
 /*******************************************************************************
  * global functions
@@ -146,17 +174,17 @@ BasicBlock* getStaticBBLs( RTN rtn,
     while (INS_Valid(in)) {
         ADDRINT insAddr = INS_Address(in);
         if (leaders.find( insAddr ) != leaders.end()) {
-            BasicBlock **successor = &curBBL->successor;
             exitBBLMap[curBBL->exit_ins] = curBBL;
-            curBBL = new BasicBlock( insAddr, curBBL );
-            leaderBBLMap[insAddr] = curBBL;
-            //if (hasFallThrough)
+            if (hasFallThrough) {
+                BasicBlock **successor = &curBBL->successor;
+                curBBL = new BasicBlock( insAddr, curBBL );
                 *successor = curBBL;
+            } else
+                curBBL = new BasicBlock( insAddr, nullptr );
+            leaderBBLMap[insAddr] = curBBL;
         }
         curBBL->exit_ins = insAddr;
         hasFallThrough = INS_HasFallThrough( in ) || INS_IsCall( in );
-        if (!hasFallThrough)
-          std::cout << "... " << INS_Disassemble( in ) << std::endl;
         in = INS_Next(in);
     }
     RTN_Close(rtn);
@@ -170,8 +198,6 @@ BasicBlock* getStaticBBLs( RTN rtn,
             if (target != leaderBBLMap.end()) {
                 target->second->predecessors.insert(source->second->id);
                 source->second->target = target->second;
-                if (!source->second->successor)
-                  source->second->successor = target->second;
             }
         }
     }
@@ -243,6 +269,75 @@ void getDominators( BasicBlock* root ) {
 
 }
 
+void collectLoop(id_t header,
+                 id_t current,
+                 Loop& loop,
+                 bool initial = true) {
+
+    static std::set<id_t> visited;
+
+    if (initial)
+        visited.clear();
+
+    if (visited.find(current) != visited.end())
+        return;
+    visited.insert(current);
+
+    BasicBlock *tmp = BasicBlock::get(current);
+    if (header == tmp->id)
+        return;
+
+    if (tmp->dominators.find(header) != tmp->dominators.end()) {
+        loop.nodes.insert(tmp->id);
+        for (auto predecessor : tmp->predecessors)
+            collectLoop(header, predecessor, loop, false);
+    }
+}
+
+void identifyLoops() {
+
+    for (size_t i=0; i<BasicBlock::size(); ++i) {
+
+        BasicBlock* cur = BasicBlock::get(i);
+        if (cur->target && cur->id > cur->target->id) {
+
+
+           Loop* loop = new Loop();
+           loop->head = cur->target->id;
+           loop->tail = cur->id;
+
+           for (auto predecessor : BasicBlock::get(loop->tail)->predecessors)
+               collectLoop(loop->head, predecessor, *loop, true);
+
+           std::set<id_t> visited;
+           visited.insert (loop->head);
+           visited.insert (loop->tail);
+           for (id_t node : loop->nodes)
+               visited.insert (node);
+
+           for (id_t node : visited) {
+               BasicBlock* target = BasicBlock::get(node)->target;
+               BasicBlock* successor = BasicBlock::get(node)->target;
+
+               if (target && visited.find(target->id) == visited.end())
+                   Loop::insLoopMap[target->entry_ins] = loop;
+               if (successor && visited.find(successor->id) == visited.end())
+                   Loop::insLoopMap[successor->entry_ins] = loop;
+           }
+
+           std::cout << "a new loop is born: " << std::endl
+                     << "\t head: " << loop->head << std::endl
+                     << "\t tail: " << loop->tail << std::endl
+                     << "\t nodes: ";
+           for (id_t node : loop->nodes)
+               std::cout << node << " ";
+           std::cout << std::endl;
+
+            Loop::insLoopMap[BasicBlock::get(loop->head)->entry_ins] = loop;
+        }
+    }
+}
+
 std::string getNodeStr(BasicBlock* node) {
     std::stringstream ss;
     ss << "\t\"" << node->id << ": " << dissmap[node->entry_ins] << "\"";
@@ -252,6 +347,13 @@ std::string getNodeStr(BasicBlock* node) {
 void printCFG( BasicBlock* node,
                std::ofstream& ofs,
                int level) {
+
+    static std::set<id_t> dumpedNodes;
+
+    if (dumpedNodes.find(node->id) != dumpedNodes.end())
+        return;
+    else
+        dumpedNodes.insert(node->id);
 
     if (level == 0) {
         ofs << "digraph CFG {" << std::endl;
@@ -268,6 +370,7 @@ void printCFG( BasicBlock* node,
     }
 
     if (node->target) {
+        printCFG(node->target, ofs, level+1);
         ofs << getNodeStr(node) << "->" << getNodeStr(node->target)
             << " [style=dotted];" << std::endl;
     }
@@ -279,6 +382,13 @@ void printCFG( BasicBlock* node,
 void printDOM( BasicBlock* node,
                std::ofstream& ofs,
                int level) {
+
+    static std::set<id_t> dumpedNodes;
+
+    if (dumpedNodes.find(node->id) != dumpedNodes.end())
+        return;
+    else
+        dumpedNodes.insert(node->id);
 
     if (level == 0) {
         ofs << "digraph DOM {" << std::endl;
@@ -296,8 +406,63 @@ void printDOM( BasicBlock* node,
     if (node->successor)
         printDOM(node->successor, ofs, level+1);
 
+    if (node->target)
+        printDOM(node->target, ofs, level+1);
+
     if (level == 0)
         ofs << "}";
+}
+
+static std::map<id_t, size_t> executionCount;
+static std::map<id_t, size_t> iterationCount;
+
+VOID callOnLoopEntry(id_t id) {
+    iterationCount[id]++;
+}
+
+VOID callOnLoopExit(id_t id) {
+    executionCount[id]++;
+}
+
+void instrumentLoops( RTN rtn ) {
+
+    RTN_Open(rtn);
+
+    for (INS in = RTN_InsHead(rtn); INS_Valid(in); in = INS_Next(in)) {
+
+        ADDRINT addr = INS_Address(in);
+        if (Loop::insLoopMap.find(addr) != Loop::insLoopMap.end()) {
+
+            Loop* loop = Loop::insLoopMap[addr];
+
+            // check entry
+            BasicBlock* head = BasicBlock::get(loop->head);
+            if (head->entry_ins == addr) {
+                INS_InsertCall	( in,
+                                IPOINT_BEFORE,
+                                (AFUNPTR)callOnLoopEntry,
+                                IARG_UINT32, loop->head,
+                                IARG_END );
+               executionCount[loop->head] = 0;
+               iterationCount[loop->head] = 0;
+            }
+            // check exits
+             else {
+                for (id_t exit : loop->exits) {
+                    BasicBlock *tmp = BasicBlock::get(exit);
+                    if (tmp->entry_ins == addr)
+                        INS_InsertCall ( in,
+                                         IPOINT_BEFORE,
+                                         (AFUNPTR)callOnLoopExit,
+                                         IARG_UINT32, loop->head,
+                                         IARG_END );
+
+                }
+            }
+        }
+    }
+
+    RTN_Close(rtn);
 }
 
 VOID ImgLoad(IMG img, VOID *v) {
@@ -321,6 +486,8 @@ VOID ImgLoad(IMG img, VOID *v) {
             getDominators(root);
 
             if (name == "main") {
+              identifyLoops();
+              instrumentLoops(rtn);
               std::cout << "end" << std::endl;
               std::ofstream ofs;
               std::ofstream ofsdom;
@@ -337,6 +504,12 @@ VOID ImgLoad(IMG img, VOID *v) {
 
 VOID Fini(INT32 code, VOID *v) {
 
+    std::cout << "finished\n";
+
+    for (auto exec : executionCount)
+        std::cout << "executions of loop " << exec.first << ": " << exec.second << std::endl;
+    for (auto exec : iterationCount)
+        std::cout << "iterations of loop " << exec.first << ": " << exec.second << std::endl;
 }
 
 /* ===================================================================== */

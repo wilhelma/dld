@@ -39,13 +39,34 @@ int main(int argc, char** argv) {
 	else
 		a = foo(4) + bar();
 
-	for (int i=0; i<a; ++i) {
+	for (int i=0; i<2002; ++i) {
+
+		if (i < 50)
+			a = a + 1;
+		if (i > 50)
+			a = a - 1;
+	}
+
+	for (int i=0; i<1001; ++i) {
 
 		b = b + a;
 		b = b * a;
-		if (b > 10000)
+		if (b > 1000000000)
 			break;
 	}
+
+	while (b > 10) {
+		b = b - a;
+		a = a + b;
+	}
+
+	do {
+		int i=10;
+		for ( ; i<5; --i)
+			a = a - foo(b);
+		if (b = 1000)
+			break;
+	} while (a > b);
 
 
 	std::cout << "result is " << b << std::endl;
