@@ -23,193 +23,116 @@ dissmap_t dissmap;
 class BasicBlock {
 public:
 
-    // types
-    typedef size_t id_t;
-    typedef std::vector<BasicBlock*> bbls_t;
+  // types
+  typedef size_t id_t;
+  typedef std::vector<BasicBlock*> bbls_t;
 
-    // attributes
-    id_t id;						// id of the basic block (starting from 0)
-    ADDRINT entry_ins;				// address of the first instruction
-    ADDRINT exit_ins;				// address of the last instruction
-    std::set<id_t> predecessors;	// set of id's of all predecessors
-    std::set<id_t> dominators;		// set of id's of all dominators
-    BasicBlock* successor;			// pointer to the successor
-    BasicBlock* target;			// pointer to the target (if existing)
-    BasicBlock* iDom;				// immediate dominator
+  // attributes
+  id_t id;						// id of the basic block (starting from 0)
+  ADDRINT entry_ins;				// address of the first instruction
+  ADDRINT exit_ins;				// address of the last instruction
+  std::set<id_t> predecessors;	// set of id's of all predecessors
+  std::set<id_t> dominators;		// set of id's of all dominators
+  BasicBlock* successor;			// pointer to the successor
+  BasicBlock* target;			// pointer to the target (if existing)
+  BasicBlock* iDom;				// immediate dominator
 
-    //--------------------------------------------------------------------------
+  //--------------------------------------------------------------------------
 
-    // the constructor
-    explicit BasicBlock( ADDRINT entry_ins,
-                         BasicBlock* predecessor )
-            : id(gID++), entry_ins(entry_ins),
-              successor(nullptr), target(nullptr), iDom(nullptr) {
+  // the constructor
+  explicit BasicBlock( ADDRINT entry_ins,
+                       BasicBlock* predecessor )
+          : id(gID++), entry_ins(entry_ins),
+            successor(nullptr), target(nullptr), iDom(nullptr) {
+      if (predecessor)
+          predecessors.insert( predecessor->id );
+      gBasicBlocks.push_back(this);
+  }
 
-        if (predecessor)
-            predecessors.insert( predecessor->id );
-        gBasicBlocks.push_back(this);
-    }
+  // resets the static information
+  static void reset() {
+      gID = 0;
+      gBasicBlocks.clear();
+  }
 
-    // resets the static information
-    static void reset() {
+  // get pointer to the basic block with given id
+  static BasicBlock* get(id_t id) { return gBasicBlocks[id]; }
 
-        gID = 0;
-        gBasicBlocks.clear();
-    }
+  // get current number of inserted basic blocks
+  static size_t size() { return gBasicBlocks.size(); }
 
-    // get pointer to the basic block with given id
-    static BasicBlock* get(id_t id) {
-
-        return gBasicBlocks[id];
-    }
-
-    // get current number of inserted basic blocks
-    static size_t size() {
-
-        return gBasicBlocks.size();
-    }
-
-    bool isPredecessor(id_t searchID) {
-
-        for (id_t predID : predecessors) {
-            if (predID > id)
-                continue;
-            if (predID == searchID)
-                return true;
-            if (BasicBlock::get(predID)->isPredecessor(searchID))
-                return true;
-        }
-
-        return false;
-    }
+  // get root block
+  static BasicBlock* getRoot() { return root; }
 
 private:
-    static BasicBlock::id_t gID;
-    static bbls_t gBasicBlocks;
-};
-BasicBlock::id_t BasicBlock::gID = 0;
-BasicBlock::bbls_t BasicBlock::gBasicBlocks;
+  /* getStaticBBLs()
+  *
+  * builds a cfg consisting of newly allocated bbl's and returning the root
+  * of the cfg.
+  * This is done by considering each leader instruction as the beginning of a
+  * bbl, each transition as a successor relation, and each jump as a target
+  * relation. The predecessor attribute is filled accordingly to the successor
+  * and target relation. The dominator attribute is not filled here (see
+  * getDominators()).
+  */
+  static void buildStaticBBLs( RTN rtn,
+                                 const leaders_t& leaders,
+                                 const jumps_t& jumps ) {
 
-struct Loop {
-    typedef std::map<ADDRINT, Loop*> insLoopMap_t;
+      std::map<ADDRINT, BasicBlock*> leaderBBLMap, exitBBLMap;
+      BasicBlock* curBBL = nullptr;
 
-    BasicBlock::id_t head;
-    BasicBlock::id_t tail;
-    std::set<BasicBlock::id_t> nodes;
-    std::set<BasicBlock::id_t> exits;
+      RTN_Open(rtn);
 
-    static insLoopMap_t insLoopMap;
-};
-Loop::insLoopMap_t Loop::insLoopMap;
+      // head instruction
+      INS in = RTN_InsHead(rtn);
+      if (INS_Valid(in)) {
+          ADDRINT insAddr = INS_Address(in);
+          BasicBlock::root = curBBL = new BasicBlock( insAddr, nullptr );
+          leaderBBLMap[insAddr] = curBBL;
+          curBBL->exit_ins = insAddr;
+          in = INS_Next(in);
+      }
 
+      // other instructions
+      bool hasFallThrough = true;
+      while (INS_Valid(in)) {
+          ADDRINT insAddr = INS_Address(in);
+          if (leaders.find( insAddr ) != leaders.end()) {
+              exitBBLMap[curBBL->exit_ins] = curBBL;
+              if (hasFallThrough) {
+                  BasicBlock **successor = &curBBL->successor;
+                  curBBL = new BasicBlock( insAddr, curBBL );
+                  *successor = curBBL;
+              } else
+                  curBBL = new BasicBlock( insAddr, nullptr );
+              leaderBBLMap[insAddr] = curBBL;
+          }
+          curBBL->exit_ins = insAddr;
+          hasFallThrough = INS_HasFallThrough( in ) || INS_IsCall( in );
+          in = INS_Next(in);
+      }
+      RTN_Close(rtn);
 
-/*******************************************************************************
- * global functions
- ******************************************************************************/
+      // consider jump instructions (for targets/predecessors)
+      for ( auto edge : jumps ) {
+          auto source = exitBBLMap.find( edge.first );
+          auto target = leaderBBLMap.find( edge.second );
 
-/* getBBLFrontiers()
- *
- * iterates over all instruction in a given routine rtn to:
- * 	- identify the entry instruction of every static (compiler) BBL (=leaders)
- *  - identify all unconditional jumps (=jumps)
- */
-void getBBLFrontiers( RTN rtn,
-                    leaders_t& leaders,
-                    jumps_t& jumps ) {
+          if (source != exitBBLMap.end()) {
+              if (target != leaderBBLMap.end()) {
+                  target->second->predecessors.insert(source->second->id);
+                  source->second->target = target->second;
+              }
+          }
+      }
+  }
 
-    bool isFirst = true;
-
-    RTN_Open(rtn);
-    for (INS in = RTN_InsHead(rtn); INS_Valid(in); in = INS_Next(in)) {
-
-        dissmap[INS_Address(in)] = INS_Disassemble(in);
-
-        if (isFirst) {
-            leaders.insert( INS_Address(in) );
-            isFirst = false;
-        }
-
-
-        if (INS_IsDirectBranchOrCall(in)) {
-            ADDRINT target = INS_DirectBranchOrCallTargetAddress(in);
-            leaders.insert( target );
-            jumps[INS_Address(in)] = target;
-            isFirst = true;
-        }
-    }
-    RTN_Close(rtn);
-}
-
-/* getStaticBBLs()
- *
- * builds a cfg consisting of newly allocated bbl's and returning the root of
- * the cfg.
- * This is done by considering each leader instruction as the beginning of a
- * bbl, each transition as a successor relation, and each jump as a target
- * relation. The predecessor attribute is filled accordingly to the successor
- * and target relation. The dominator attribute is not filled here (see
- * getDominators()).
- */
-BasicBlock* getStaticBBLs( RTN rtn,
-                           const leaders_t& leaders,
-                           const jumps_t& jumps ) {
-
-    std::map<ADDRINT, BasicBlock*> leaderBBLMap, exitBBLMap;
-    BasicBlock *root = nullptr, *curBBL = nullptr;
-
-    RTN_Open(rtn);
-
-    // head instruction
-    INS in = RTN_InsHead(rtn);
-    if (INS_Valid(in)) {
-        ADDRINT insAddr = INS_Address(in);
-        root = curBBL = new BasicBlock( insAddr, nullptr );
-        leaderBBLMap[insAddr] = curBBL;
-        curBBL->exit_ins = insAddr;
-        in = INS_Next(in);
-    }
-    
-    // other instructions
-    bool hasFallThrough = true;
-    while (INS_Valid(in)) {
-        ADDRINT insAddr = INS_Address(in);
-        if (leaders.find( insAddr ) != leaders.end()) {
-            exitBBLMap[curBBL->exit_ins] = curBBL;
-            if (hasFallThrough) {
-                BasicBlock **successor = &curBBL->successor;
-                curBBL = new BasicBlock( insAddr, curBBL );
-                *successor = curBBL;
-            } else
-                curBBL = new BasicBlock( insAddr, nullptr );
-            leaderBBLMap[insAddr] = curBBL;
-        }
-        curBBL->exit_ins = insAddr;
-        hasFallThrough = INS_HasFallThrough( in ) || INS_IsCall( in );
-        in = INS_Next(in);
-    }
-    RTN_Close(rtn);
-
-    // consider jump instructions (for targets/predecessors)
-    for ( auto edge : jumps ) {
-        auto source = exitBBLMap.find( edge.first );
-        auto target = leaderBBLMap.find( edge.second );
-
-        if (source != exitBBLMap.end()) {
-            if (target != leaderBBLMap.end()) {
-                target->second->predecessors.insert(source->second->id);
-                source->second->target = target->second;
-            }
-        }
-    }
-
-    return root;
-}
-
-/* getDominators()
- *
- * computes the dominators of all basic blocks in the cfg
- */
-void getDominators( BasicBlock* root ) {
+  /* getDominators()
+   *
+   * computes the dominators of all basic blocks in the cfg
+   */
+  void getDominators( BasicBlock* root ) {
 
     const size_t nBBL = BasicBlock::size();
     std::unique_ptr< boost::dynamic_bitset<> >* domBitSets =
@@ -218,19 +141,19 @@ void getDominators( BasicBlock* root ) {
     // for each bbl, create a dominator bitset for efficient set operations
     for (size_t i=0; i<nBBL; ++i)
         domBitSets[i] = std::unique_ptr< boost::dynamic_bitset<> >(
-                    new boost::dynamic_bitset<>(nBBL) );
+                        new boost::dynamic_bitset<>(nBBL) );
     domBitSets[0]->reset();
     domBitSets[0]->set(0);
     for (size_t i=1; i<nBBL; ++i)
-      domBitSets[i]->set();
+        domBitSets[i]->set();
 
     // compute dominators (fixpoint algorithm)
     bool changed = true;
     while (changed) {
         changed = false;
-        for (size_t i=1; i<nBBL; ++i) {
-            boost::dynamic_bitset<> tmp(*domBitSets[i].get());
-            for (BasicBlock::id_t pred : BasicBlock::get(i)->predecessors)
+      for (size_t i=1; i<nBBL; ++i) {
+          boost::dynamic_bitset<> tmp(*domBitSets[i].get());
+        for (BasicBlock::id_t pred : BasicBlock::get(i)->predecessors)
                 *domBitSets[i].get() &= *domBitSets[pred].get();
             domBitSets[i]->set(i);
             if (tmp != *domBitSets[i].get())
@@ -266,8 +189,67 @@ void getDominators( BasicBlock* root ) {
         }
       }
     }
+  }
 
+  static BasicBlock::id_t gID;
+  static bbls_t gBasicBlocks;
+  static BasicBlock* root;
+};
+BasicBlock* BasicBlock::root = nullptr;
+BasicBlock::id_t BasicBlock::gID = 0;
+BasicBlock::bbls_t BasicBlock::gBasicBlocks;
+
+class Loop {
+public:
+    typedef std::map<ADDRINT, Loop*> insLoopMap_t;
+
+    BasicBlock::id_t head;
+    BasicBlock::id_t tail;
+    std::set<BasicBlock::id_t> nodes;
+    std::set<BasicBlock::id_t> exits;
+
+    static insLoopMap_t insLoopMap;
+};
+Loop::insLoopMap_t Loop::insLoopMap;
+
+
+/*******************************************************************************
+ * global functions
+ ******************************************************************************/
+
+/* getBBLFrontiers()
+ *
+ * iterates over all instruction in a given routine rtn to:
+ * 	- identify the entry instruction of every static (compiler) BBL (=leaders)
+ *  - identify all unconditional jumps (=jumps)
+ */
+void getBBLFrontiers( RTN rtn,
+                      leaders_t& leaders,
+                      jumps_t& jumps ) {
+
+    bool isFirst = true;
+
+    RTN_Open(rtn);
+    for (INS in = RTN_InsHead(rtn); INS_Valid(in); in = INS_Next(in)) {
+
+        dissmap[INS_Address(in)] = INS_Disassemble(in);
+
+        if (isFirst) {
+            leaders.insert( INS_Address(in) );
+            isFirst = false;
+        }
+
+        if (INS_IsDirectBranchOrCall(in)) {
+            ADDRINT target = INS_DirectBranchOrCallTargetAddress(in);
+            leaders.insert( target );
+            jumps[INS_Address(in)] = target;
+            isFirst = true;
+        }
+    }
+    RTN_Close(rtn);
 }
+
+
 
 void collectLoop(id_t header,
                  id_t current,
@@ -317,12 +299,16 @@ void identifyLoops() {
 
            for (id_t node : visited) {
                BasicBlock* target = BasicBlock::get(node)->target;
-               BasicBlock* successor = BasicBlock::get(node)->target;
+               BasicBlock* successor = BasicBlock::get(node)->successor;
 
-               if (target && visited.find(target->id) == visited.end())
-                   Loop::insLoopMap[target->entry_ins] = loop;
-               if (successor && visited.find(successor->id) == visited.end())
-                   Loop::insLoopMap[successor->entry_ins] = loop;
+               if (target && visited.find(target->id) == visited.end()) {
+                 loop->exits.insert(target->id);
+                 Loop::insLoopMap[target->entry_ins] = loop;
+               }
+               if (successor && visited.find(successor->id) == visited.end()) {
+                 loop->exits.insert(successor->id);
+                 Loop::insLoopMap[successor->entry_ins] = loop;
+               }
            }
 
            std::cout << "a new loop is born: " << std::endl
@@ -330,6 +316,10 @@ void identifyLoops() {
                      << "\t tail: " << loop->tail << std::endl
                      << "\t nodes: ";
            for (id_t node : loop->nodes)
+               std::cout << node << " ";
+           std::cout << std::endl;
+           std::cout << "\t exits: ";
+           for (id_t node : loop->exits)
                std::cout << node << " ";
            std::cout << std::endl;
 
